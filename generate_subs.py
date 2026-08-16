@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-#v2.2
+#v3.1
 """
 Generate an .srt subtitle file from any video file using faster-whisper.
 Optionally hard-code (burn) the subtitles into a new video file.
@@ -21,7 +21,7 @@ Also requires: ffmpeg (system package, usually pre-installed)
 
 VENV: If done with a venv, anytime you want to use the script, just run:    source ~/whisper-env/bin/activate
                                                                             generate_subs whatever.mp4
-When you’re done (or want to use system Python again):                      deactivate
+When you're done (or want to use system Python again):                      deactivate
 
 ALTERNATIVELY, change the first line at the top to #!/home/user/.../whisper-env/bin/python
 
@@ -34,21 +34,42 @@ from pathlib import Path
 from tqdm import tqdm
 from faster_whisper import WhisperModel
 
-def transcribe(video_path, model_size="small"):
+# --- Subtitle line-splitting settings ---
+# gap_threshold  -- silence (seconds) between words that triggers a new line
+# max_duration   -- max seconds a single line can stay on screen, even
+#                    without a pause, purely for readability
+# max_chars      -- max characters before forcing a new line (readability)
+# end_grace      -- extra seconds ADDED onto a line's end time so it doesn't
+#                    disappear the instant speech stops. Capped so it never
+#                    overlaps into the next line.
+GAP_THRESHOLD = 1.0
+MAX_DURATION = 9.0
+MAX_CHARS = 42
+END_GRACE = 0.4
+
+def transcribe(video_path, model_size="medium"):
     print(f"Loading {model_size} model and analyzing audio (this takes a moment)...")
     model = WhisperModel(model_size, device="cuda", compute_type="float16")
-    # tuple unpacking. convert video path type to string. Voice Activity Detection.
-    segments, info = model.transcribe(str(video_path), vad_filter=True)
-    # f-string lets you embed variables inside {}. language, 2-digit probability
+
+    # word_timestamps=True gives per-word start/end times, not just per-segment.
+    # This lets us trim subtitles to when speech actually happens, instead of
+    # leaving text on screen during silent pauses.
+    segments, info = model.transcribe(
+        str(video_path),
+        vad_filter=True,
+        word_timestamps=True,
+    )
+
     print(f"Detected language: {info.language} ({info.language_probability:.2f})")
+
     segments_list = []
     with tqdm(total=round(info.duration, 2), unit="sec", desc="Transcribing") as pbar:
         last_end = 0.0
         for segment in segments:
             segments_list.append(segment)
-            # Advance the bar by the amount of new audio this segment covers
             pbar.update(segment.end - last_end)
             last_end = segment.end
+
     return info.language, segments_list
 
 def format_time(seconds):
@@ -59,14 +80,70 @@ def format_time(seconds):
     ms = round((seconds - int(seconds)) * 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
 
+def build_subtitle_lines(segments):
+    """
+    Rebuild subtitle lines from word-level timestamps instead of using
+    Whisper's raw segments directly. This prevents subtitles from lingering
+    on screen during silent pauses, while still giving text a small grace
+    period so it doesn't vanish the instant speech ends.
+    """
+    lines = []
+    current_words = []
+
+    for segment in segments:
+        # segment.words only exists because we passed word_timestamps=True
+        for word in segment.words:
+            if not current_words:
+                current_words.append(word)
+                continue
+
+            prev_word = current_words[-1]
+            gap = word.start - prev_word.end
+            current_text = "".join(w.word for w in current_words)
+            duration_if_added = word.end - current_words[0].start
+
+            # Decide whether to cut a new line BEFORE adding this word
+            if (gap > GAP_THRESHOLD
+                    or len(current_text) > MAX_CHARS
+                    or duration_if_added > MAX_DURATION):
+                lines.append(current_words)
+                current_words = [word]
+            else:
+                current_words.append(word)
+
+    if current_words:
+        lines.append(current_words)
+
+    # --- Add a small grace period to each line's end time ---
+    # This lets text linger a little instead of disappearing the instant
+    # the last word ends, but never overlaps into the next line.
+    for i, words in enumerate(lines):
+        grace_end = words[-1].end + END_GRACE
+
+        if i + 1 < len(lines):
+            next_start = lines[i + 1][0].start
+            grace_end = min(grace_end, next_start - 0.05)  # small buffer, no overlap
+
+        words[-1].end = grace_end
+
+    return lines
+
 def generate_subtitle_file(video_path, language, segments, model_size):
-    # Sidecar naming: "show.mkv" -> "show.en.srt". VLC auto-loads it.
-    srt_path = video_path.with_suffix(f".{language}-{model_size}.srt") # builds output filename
+    # Sidecar naming: "show.mkv" -> "show.en-medium.srt"
+    srt_path = video_path.with_suffix(f".{language}-{model_size}.srt")
+
+    lines = build_subtitle_lines(segments)
+
     with open(srt_path, "w", encoding="utf-8") as f:
-        for index, segment in enumerate(segments, start=1):
+        for index, words in enumerate(lines, start=1):
+            start = words[0].start
+            end = words[-1].end
+            text = "".join(w.word for w in words).strip()
+
             f.write(f"{index}\n")
-            f.write(f"{format_time(segment.start)} --> {format_time(segment.end)}\n")
-            f.write(f"{segment.text.strip()}\n\n")
+            f.write(f"{format_time(start)} --> {format_time(end)}\n")
+            f.write(f"{text}\n\n")
+
     return srt_path
 
 def burn_subtitles_into_video(video_path, srt_path):
@@ -74,37 +151,39 @@ def burn_subtitles_into_video(video_path, srt_path):
     # Only useful for players/devices/uploads that don't support sidecar subs.
     output_path = video_path.with_name(f"{video_path.stem}_subbed.mp4")
     cmd = [
-        "ffmpeg", "-y", # program to run, if alrdy exists, overwrite w/o asking
-        "-i", str(video_path), # input file
-        "-vf", f"subtitles='{srt_path}'", # renders the SRT text onto the video pixels
-        "-c:v", "libx264", "-preset", "medium", "-crf", "20", # H.264 re-encode the video because we’re modifying the pixels. medium speed. constant rate factor (lower = better quality, bigger file size)
-        "-c:a", "copy", # copy the audio stream unchanged
-        str(output_path), #output filename
+        "ffmpeg", "-y",
+        "-i", str(video_path),
+        "-vf", f"subtitles='{srt_path}'",
+        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+        "-c:a", "copy",
+        str(output_path),
     ]
-    subprocess.run(cmd, check=True) # actually runs the command, exit code raised
+    subprocess.run(cmd, check=True)
     return output_path
 
-def run(video_path, model_size="small", burn=False): #burn=False is the default argument
-    language, segments = transcribe(video_path, model_size) # Step 1: transcribe
-    srt_path = generate_subtitle_file(video_path, language, segments, model_size) # Step 2: write .srt
+def run(video_path, model_size="medium", burn=False):
+    language, segments = transcribe(video_path, model_size)
+    srt_path = generate_subtitle_file(video_path, language, segments, model_size)
     print(f"\nSubtitles saved to: {srt_path}")
-    if burn: # Step 3: (optional): burn in
+
+    if burn:
         output_path = burn_subtitles_into_video(video_path, srt_path)
         print(f"Hard-subbed video saved to: {output_path}")
 
-if __name__ == "__main__": # only run this code when the file is executed directly, not when it’s imported
+if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: generate_subs <video> [--burn] [--model small|medium|large-v3]")
         sys.exit(1)
-    # user didn’t provide any arguments. print usage instructions. exit with code 1
-    video_path = Path(sys.argv[1]) # Grab video filename and wrap in Path object
+
+    video_path = Path(sys.argv[1])
     if not video_path.is_file():
         print(f"File not found: {video_path}")
         sys.exit(1)
-    # Sanity check
+
     args = sys.argv[2:]
-    burn = "--burn" in args # check if --burn flag is enabled
-    model_size = "small"
+    burn = "--burn" in args
+    model_size = "medium"
     if "--model" in args:
         model_size = args[args.index("--model") + 1]
+
     run(video_path, model_size=model_size, burn=burn)
